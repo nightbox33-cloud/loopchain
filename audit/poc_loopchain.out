@@ -1,0 +1,7 @@
+[1] valid v3 tx  hash=48ce538225829d0b
+    hash+signature OK (serializer-derived origin data, ecrecover vs from_address)
+[2] tampered value w/ original signature -> TransactionInvalidSignatureError (rejected)
+[3] foreign key's signature -> TransactionInvalidSignatureError (rejected)
+[4] nid mismatch -> TransactionInvalidNidError (rejected)
+[5] block vote signature OK; signed fields: ['blockHash', 'blockHeight', 'rep', 'round', 'timestamp']
+[6] vote replay onto different block hash -> Vote block_hash not match (rejected)
