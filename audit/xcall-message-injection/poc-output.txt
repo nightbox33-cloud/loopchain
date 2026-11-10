@@ -13,18 +13,27 @@
   attacker balance delta = 100n ETH
   vault balance now      = 0n ETH
 
+[control 2] attempt to poison callReply from outside a reply context
+            (sendCallMessage with sources=[] and no default connection)
+  rejected as expected -> NoDefaultConnection (isReply()==false)
+
+[exploit 4] same forgery delivered through handleBTPMessage()
+  handleBTPMessage accepted, executeCall(2) -> attacker balance delta = 33n ETH
+
 [exploit 2] same forgery with protocols = [attacker, attacker]
              (the "multi-protocol quorum" branch, lines 451-460)
   quorum satisfied by a single caller; 2-of-2 quorum collapsed to 1-of-2
-  attacker balance delta = 0n ETH (vault already empty)
+  executeCall(3) -> attacker balance delta = 20n ETH
+  vaultQ balance now     = 0n ETH
 
 [exploit 3] forged CS_RESULT + reply (the "reply spoofing" leg)
-  attacker-controlled "connection": 0xA1eD4d0134858BAe8B320F13C90ab97Fb8222677
+  attacker-controlled "connection": 0xe4C050A518d1945c56485c92dc8E885f050D79EE
   rollback state created for sn=1 (from attacker, sources=[attackerConn])
   forged CS_RESULT accepted: handleResult -> handleReply (rollback.sources check passes)
   vault2 called with from ="0x2.ICON/hx2222222222222222222222222222222222222222" although no such reply ever existed
   attacker balance delta = 55n ETH
   vault2 balance now     = 0n ETH
 
-RESULT: attacker EOA took 100 ETH of third-party funds from the Vault
-        with a forged cross-chain message from a non-existent relayer.
+RESULT: attacker EOA (no role, no bond, no fee paid) extracted 208n ETH
+        of third-party funds via forged cross-chain messages,
+        through four distinct public entry points of CallService.

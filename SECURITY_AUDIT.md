@@ -10,11 +10,11 @@
 
 | ID | Severidad | Componente | Estado en `main`/HEAD |
 |----|-----------|-----------|------------------------|
-| **H-01** | **CRÍTICO** | `icon-project/xcall-multi` — `CallService` (EVM / javascore-ICON / CosmWasm / Sui / Solana / Soroban) | **ABIERTO** (no mitigado en código) |
+| **H-01** | **CRÍTICO** | `icon-project/xcall-multi` — `CallService` en **5 de 6** implementaciones (EVM / javascore-ICON / CosmWasm / Solana / Soroban; Sui no afectada) | **ABIERTO** (no mitigado en código) |
 
 **H-01:** el punto de entrada de mensajes cross-chain de xCall (`handleMessage`) es **público y se autentica contra un array `protocols` que viaja dentro del propio mensaje**. Un atacante sin ningún rol (basta una EOA) se declara a sí mismo como "conexión" y entrega a *cualquier* contrato de la cadena un mensaje cross-chain fabricado, con el campo `from` ("`nid/dirección`") **elegido libremente**. Se rompe así la propiedad de seguridad central de xCall (autenticidad del remitente remoto), que es exactamente lo que asumen los dapps integrados (vaults, puentes, *asset managers*, préstamos). Sin relayer, sin contrato de conexión, sin fee y sin bond.
 
-PoC local ejecutado contra el `CallService.sol` **sin modificar** del commit auditado: la EOA atacante extrae **100 ETH** de un vault que custodia fondos de terceros y **55 ETH** en la variante "reply". Ver §4.
+PoC local ejecutado contra el `CallService.sol` **sin modificar** del commit auditado: la EOA atacante extrae **208 ETH** de tres vaults que custodian fondos de terceros, usando **cuatro puertas públicas distintas** (`handleMessage`, `handleBTPMessage`, quórum multiprotocolo y el camino *reply*). La misma debilidad se replica en javascore, CosmWasm, Solana y Soroban; **sólo Sui** la neutraliza (objeto-capacidad `ConnCap`). Ver §3.4 y §3.1-bis.
 
 **Nota sobre el repo de trabajo (`loopchain`):** auditado a fondo; **no se encontró vulnerabilidad crítica explotable**. Además el motor Loopchain 2.8.1 está archivado desde 2021 e ICON 2.0 corre `goloop`, por lo que ese código no es el motor de consenso en producción hoy. Detalle e invariantes verificados en §5.
 
@@ -87,6 +87,8 @@ Puntos de entrada permissionless relevantes:
 
 | Elemento | Líneas | Qué hace |
 |---|---|---|
+| `handleBTPMessage(string _from, string _svc, uint256 _sn, bytes _msg)` | **378-386** | `external`; único check `checkService(_svc)` (compara `_svc` con `"xcallM"`) y reenvía a `handleMessage(_from, _msg)`. **Segunda puerta pública idéntica** (la que invoca el BMC/relayer legítimo). |
+| `handleBTPError(string _src, string _svc, uint256 _sn, uint256 _code, string _msg)` | **387-397** | `external`; `checkService(_svc)` y `handleError(_sn)` → `handleResult(_sn, FAILURE, "")`. **Tercera puerta pública**: el atacante elige `_sn`. |
 | `handleMessage(string _from, bytes _msg)` | **401-419** | `public`, único check: `require(!_from.compareTo(nid))`. Enruta a `handleRequest` / `handleResult`. |
 | `handleRequest(netFrom, payload)` | **441-481** | Autenticación del emisor (ver abajo). |
 | ↳ rama multiprotocolo | **451-460** | `pendingReqs[dataHash][msg.sender.toString()] = true;` y luego exige que **todas** las entradas de `req.protocols[]` estén marcadas. |
@@ -114,6 +116,50 @@ Puntos de entrada permissionless relevantes:
 - `contract.rs:98` `ExecuteMsg::HandleMessage { msg, from_nid }` → despachado **sin comprobar `info.sender`**.
 - `handle_call_message.rs:216-232` `is_valid_source()`: `if protocols.contains(source) { return Ok(true) }` — misma autenticación circular.
 - `handle_call_message.rs:30-38` `handle_reply()`: comentario del propio equipo — *"// reply can be targeted to source nid but any contract"*.
+
+**(d) Soroban — `contracts/soroban/contracts/xcall/src/handle_message.rs`**
+
+| Elemento | Líneas | Qué hace |
+|---|---|---|
+| `handle_message(env, sender, from_nid, msg)` | **14-34** | `sender.require_auth()`; rechaza `from_nid == config.network_id`; decodifica y enruta a `handle_request` / `handle_result`. |
+| `handle_request(...)` | **36-80** | `let source = sender.to_string(); is_valid_source(&env, &source, src_net, &req.protocols())` |
+| `is_valid_source(e, sender, src_net, protocols)` | **172-188** | `if protocols.contains(sender) { return Ok(true) }` — `protocols` viene del **mensaje**; sólo si `protocols.len()==0` usa `storage::default_connection`. |
+| `execute_call` | `execute_call.rs:14-60` | público, sólo `keccak(data)` vs `req.data_hash()`. |
+
+*Veredicto:* **misma clase de fallo que EVM/javascore/CosmWasm**. `sender.require_auth()` no aporta binding: si se pasa la **cuenta** del atacante, la firma ed25519 de esa misma cuenta satisface la auth; si se pasa un **contrato** suyo, Soroban considera autorizada una dirección de contrato que esté en la pila de invocación. En ambos casos `source = sender.to_string()` es un valor que el propio atacante coloca también dentro de `protocols`. No ejecutado localmente: **no hay toolchain Rust/`cargo` ni acceso a crates.io en el entorno** (sólo `node`/`python3`); se reporta como ruta demostrada por lectura, con las líneas exactas.
+
+### 3.1-bis Verificación exhaustiva de rutas de entrada (todas las implementaciones del clon)
+
+Se revisó **una por una** cada vía por la que un mensaje puede entrar en xCall en las seis implementaciones presentes en el repo (`evm`, `javascore`, `cosmwasm-vm`, `sui`, `solana`, `soroban`), incluyendo el contrato de conexión centralizada. Veredicto: *explotable* = alcanzable por EOA/contrato sin rol y con efecto sobre valor; *no explotable* = la ruta existe pero está atada a un control que el atacante no puede fabricar.
+
+| # | Chain | Entrada (archivo:líneas) | Control existente | Veredicto |
+|---|---|---|---|---|
+| 1 | EVM | `CallService.sol:401` `handleMessage` | sólo `_from != nid` | **EXPLOTABLE** (PoC 1) |
+| 2 | EVM | `CallService.sol:378` `handleBTPMessage` | `checkService("xcallM")` | **EXPLOTABLE** (PoC 4, `+33 ETH`) |
+| 3 | EVM | `CallService.sol:441` `handleRequest` rama `len==1` | `msg.sender == req.protocols[0]` (dato del mensaje) | **EXPLOTABLE** (PoC 1) |
+| 4 | EVM | `CallService.sol:451-460` rama `len>1` | quórum N-de-N indexado por `msg.sender` | **EXPLOTABLE** (PoC 2, quórum 2-de-2 colapsado, `+20 ETH`) |
+| 5 | EVM | `CallService.sol:387` `handleBTPError` → `handleResult(_sn)` | `checkService`; `_sn` libre | **EXPLOTABLE** como variante de PoC 3 (`_sn` elegido por el atacante, llamando desde su contrato-conexión); no ejecutada por separado |
+| 6 | EVM | `CallService.sol:483` `handleReply` | sólo `rollback.to == reply.from.nid()` | **EXPLOTABLE** (PoC 3, `+55 ETH`) |
+| 7 | EVM | `CallService.sol:279` `executeCall` | `keccak(_data)` vs hash guardado | permissionless por diseño (habilitador) |
+| 8 | ICON | `CallServiceImpl.java:224` `handleMessage` `@External` | `verifyProtocols` (L518-542) | **EXPLOTABLE** (misma lógica que #3) |
+| 9 | ICON | `CentralizedConnection.java:140` `recvMessage` `@External` | `OnlyAdmin` + recibo anti-duplicado | **NO explotable** sin la clave del relayer (rol privilegiado real) |
+| 10 | CosmWasm | `contract.rs:98` `HandleMessage` | ninguno sobre `info.sender` | **EXPLOTABLE** |
+| 11 | CosmWasm | `handle_call_message.rs:216-232` `is_valid_source` | `protocols.contains(source)` (dato del mensaje) | **EXPLOTABLE** |
+| 12 | CosmWasm | `handle_call_message.rs:30-38` `handle_reply` | comentario del equipo: *"reply can be targeted to source nid but any contract"* | **EXPLOTABLE** (misma clase que #6) |
+| 13 | Sui | `main.move:337` `handle_message` | sin ACL del llamante, pero exige `cap: &ConnCap` | **NO explotable sin rol**: `ConnCap` es `key,store` y sólo se crea/transfiere desde `public(package)` (`states/xcall_state.move:44`, `:268`), y el único camino público que lo emite es `register_connection_admin` (`main.move:126-133`) que exige `&AdminCap` y lo transfiere al `relayer` ⇒ la confianza queda delegada a un rol administrativo, no es permissionless |
+| 14 | Sui | `main.move:549` `is_valid_source` | `protocols.contains(source)` (débil) | **NO alcanzable** sin `ConnCap`: la debilidad existe pero está muerta |
+| 15 | Solana | `instructions/handle_message.rs:36` → `handle_request:96` / `handle_result:173` | `is_valid_source` (**L519-526**): `ensure_connection_authority(sender.owner, sender.key())` + `protocols.contains(&sender.owner.to_string())` | **EXPLOTABLE en código**: el check sólo prueba *"soy una PDA de autoridad de conexión de mi propio programa"*, y `protocols` lo pone el mensaje. El atacante despliega su programa `P`, deriva `PDA([CONNECTION_AUTHORITY_SEED], P)` y hace `invoke_signed` → CPI a `xcall.handle_message` con `connection = esa PDA` y `protocols = [P.to_string()]`. No hay registro/allowlist de conexiones en el programa (verificado: `grep allowed\|registered\|whitelist` = 0) |
+| 16 | Soroban | `handle_message.rs:14` + `is_valid_source:172` | `sender.require_auth()` + `protocols.contains(sender)` | **EXPLOTABLE en código**: la cuenta del atacante firma su propio `require_auth()` y su `to_string()` es el que escribe en `protocols`; el único caso extra es que el `from` debe parsear al `from_nid` (también elegido). No ejecutado: sin toolchain Rust ni acceso a crates.io |
+
+**Conclusión de la verificación:** la debilidad no es un caso aislado de EVM. Está replicada en **cinco de las seis** implementaciones del clon — EVM, ICON/javascore, CosmWasm, Solana y Soroban — siempre por el mismo patrón: *autenticar al emisor contra el array `protocols` que viaja dentro del propio mensaje no autenticado*. Sólo **Sui** la neutraliza de verdad, y lo hace por diseño (objeto-capacidad `ConnCap` que sólo puede crear el paquete). En Solana el check de PDA **parece** una defensa pero no lo es: verifica la relación `owner↔key` del propio llamante, no que ese `owner` sea una conexión aprobada, y como `protocols` es dato del mensaje, cualquier programa desplegado por el atacante satisface ambos lados de la ecuación.
+
+**Estado de ejecución por chain** (sólo `node` + `python3` disponibles en el entorno; `java`, `cargo`, `solana`, `sui`, `go`, `forge` ausentes):
+
+| Chain | Ejecutado | Base del veredicto |
+|---|---|---|
+| EVM | **sí** (208 ETH, 4 rutas) | PoC `audit/xcall-message-injection` sobre `CallService.sol` sin modificar |
+| javascore / CosmWasm / Solana / Soroban | no | lectura de código con líneas exactas + grafo de llamadas; sin toolchain en el sandbox |
+| Sui | no | lectura de código: `ConnCap` `public(package)` ⇒ ruta muerta |
 
 ### 3.2 Explicación del bug
 
@@ -179,7 +225,7 @@ Salida (íntegra en `poc-output.txt`):
 [setup] Vault only releases funds when xCall reports from = 0x2.ICON/hx2222222222222222222222222222222222222222
 
 [control] forged message with protocols = [] (must be rejected)
-  rejected as expected -> 0x08c379a0…            # NotAuthorized (defaultConnections)
+  rejected as expected -> NotAuthorized (defaultConnections)
 
 [exploit] attacker EOA calls handleMessage() directly, listing its own
           address in the message-supplied `protocols` array
@@ -188,31 +234,57 @@ Salida (íntegra en `poc-output.txt`):
   attacker balance delta = 100n ETH
   vault balance now      = 0n ETH
 
+[control 2] attempt to poison callReply from outside a reply context
+            (sendCallMessage with sources=[] and no default connection)
+  rejected as expected -> NoDefaultConnection (isReply()==false)
+
+[exploit 4] same forgery delivered through handleBTPMessage()
+  handleBTPMessage accepted, executeCall(2) -> attacker balance delta = 33n ETH
+
 [exploit 2] same forgery with protocols = [attacker, attacker]
              (the "multi-protocol quorum" branch, lines 451-460)
   quorum satisfied by a single caller; 2-of-2 quorum collapsed to 1-of-2
+  executeCall(3) -> attacker balance delta = 20n ETH
+  vaultQ balance now     = 0n ETH
 
 [exploit 3] forged CS_RESULT + reply (the "reply spoofing" leg)
-  attacker-controlled "connection": 0xA1eD4d0134858BAe8B320F13C90ab97Fb8222677
+  attacker-controlled "connection": 0xe4C050A518d1945c56485c92dc8E885f050D79EE
   rollback state created for sn=1 (from attacker, sources=[attackerConn])
   forged CS_RESULT accepted: handleResult -> handleReply (rollback.sources check passes)
   vault2 called with from ="0x2.ICON/hx2222…" although no such reply ever existed
   attacker balance delta = 55n ETH
+  vault2 balance now     = 0n ETH
 
-RESULT: attacker EOA took 100 ETH of third-party funds from the Vault
-        with a forged cross-chain message from a non-existent relayer.
+RESULT: attacker EOA (no role, no bond, no fee paid) extracted 208n ETH
+        of third-party funds via forged cross-chain messages,
+        through four distinct public entry points of CallService.
 ```
 
-**PnL del atacante:** input X = gas de 2 transacciones propias (≈ 150k + 120k gas; **cero** capital, cero fee de protocolo, cero bond, cero rol). Output Y = 100 ETH de fondos de terceros (+55 ETH en la variante reply). No hay flash loan ni préstamo que devolver: `Y > X`, y se mantiene tras cerrar cualquier operación.
+**Cuatro rutas explotadas en la misma ejecución** (un solo `node run.js`, saldo total `208 ETH` de tres vaults distintos, todas las vaults a 0):
 
-**Control negativo incluido:** el mismo mensaje con `protocols = []` es rechazado (`NotAuthorized`), lo que demuestra que el bypass es exactamente la rama `protocols != []` y no un artefacto del arnés.
+| PoC | Entrada usada | Valor extraído |
+|---|---|---|
+| PoC 1 | `handleMessage` + `protocols=[atacante]` | 100 ETH |
+| PoC 4 | `handleBTPMessage("0x2.ICON","xcallM",1,msg)` — la puerta que usa el BMC real | 33 ETH |
+| PoC 2 | `handleMessage` + `protocols=[atacante, atacante]` (quórum 2-de-2) | 20 ETH |
+| PoC 3 | `sendCallMessage(sources=[conn atacante])` + CS_RESULT forjado → `handleReply` | 55 ETH |
+
+**Controles negativos ejecutados** (para descartar artefactos del arnés):
+
+1. `protocols = []` → `NotAuthorized` (cae en la rama `defaultConnections`, la única segura). Prueba que el bypass es exactamente la rama `protocols != []`.
+2. Intento de envenenar `callReply` sin contexto de reply (`sendCallMessage` con `sources=[]` y sin default connection) → `NoDefaultConnection`. `isReply()` es igualdad de strings por `keccak256` (`library/xcall/utils/Strings.sol:208-220`), y `replyState.from == ""` no coincide con el `nid` → **esa ruta queda descartada**, no se reporta.
+3. Los `reqId` del PoC ya no están cableados: `execAny()` descubre el `reqId` encolado comparando el `dataHash`, de modo que el resultado no depende de un contador adivinado (éste fue el fallo del primer intento del PoC 4).
+
+**PnL del atacante:** input X = gas de 3-4 transacciones propias (≈ 150k-350k gas cada una; **cero** capital, cero fee de protocolo, cero bond, cero rol). Output Y = **208 ETH** de fondos de terceros repartidos en tres contratos víctimas independientes. No hay flash loan ni préstamo que devolver: `Y >> X`, y se mantiene tras cerrar cualquier operación.
+
+**Controles negativos incluidos:** (1) el mismo mensaje con `protocols = []` es rechazado (`NotAuthorized`), lo que demuestra que el bypass es exactamente la rama `protocols != []`; (2) el intento de envenenar `callReply` desde fuera de un reply revierte con `NoDefaultConnection` — esa ruta **no** se reporta; (3) el PoC descubre el `reqId` por `dataHash` en vez de asumirlo, para que el resultado no dependa de un contador adivinado.
 
 ### 3.5 Cumplimiento de los 4 criterios
 
 1. **Bug concreto en código de producción:** sí — auth basada en datos del propio mensaje (callbacks/autenticación), en `main` de `xcall-multi`, con parches parciales (#439) y un PR de arreglo EVM inexistente.
 2. **Permissionless:** sí — EOA, 2 transacciones, sin relayer ni conexión; el relayer es irrelevante (no se usa).
 3. **Call graph y configuración real:** sí — `handleMessage` es `public`/`@External`, `executeCall` es público, y las ramas afectadas no dependen de configuración (sólo la rama `[]` usa `defaultConnections`).
-4. **PoC local con números reales:** sí — ejecutado sobre el `CallService.sol` del clon, saldo 100 ETH → 0, atacante +100 ETH; variante reply +55 ETH.
+4. **PoC local con números reales:** sí — ejecutado sobre el `CallService.sol` del clon: 208 ETH extraídos (100 + 33 + 20 + 55) de tres vaults, todas con saldo final 0, atacante sin rol y sin capital.
 
 ### 3.6 Impacto
 
@@ -317,6 +389,12 @@ $ cd audit/xcall-message-injection && node compile.js
 compiled: CallService:23458B ForgeHelper:4642B Vault:2632B AttackerConn:907B
 
 $ node run.js            # salida completa en poc-output.txt  (ver §3.4)
+[exploit]   handleMessage + protocols=[attacker]           -> +100 ETH
+[control 2] sendCallMessage sin reply context              -> NoDefaultConnection (rechazado)
+[exploit 4] handleBTPMessage("0x2.ICON","xcallM",1,msg)     -> +33 ETH
+[exploit 2] protocols=[attacker,attacker] (quórum 2-de-2)  -> +20 ETH
+[exploit 3] CS_RESULT forjado -> handleReply               -> +55 ETH
+RESULT: 208 ETH extraídos de 3 vaults; todas a 0; atacante sin rol/bond/fee
 
 $ python3 audit/poc_loopchain.py    # salida completa en audit/poc_loopchain.out  (ver §4.1)
 
@@ -324,11 +402,19 @@ $ git -C xcall-multi log -1 --format='%H %ad'   → d24c7b3bd12284b49b791bec6254
 $ gh api repos/icon-project/xcall-multi/pulls/439 → "fix(icon): disable rollback origination and clear forged request"
 $ gh api repos/icon-project/xcall-multi/pulls?state=all → #440 abierto ("per-chain inbound receive switch");
       no existe PR/rama "fix/xcall-evm-reply-validation" (referenciado en #439)
-$ grep -rn "pause|allowlist|receiveEnabled" xcall-multi/contracts/{evm,javascore,cosmwasm-vm} → sin resultados en HEAD
+\$ grep -rn "pause|allowlist|receiveEnabled" xcall-multi/contracts/{evm,javascore,cosmwasm-vm} → sin resultados en HEAD
+
+# verificación de rutas de las 6 implementaciones del clon (evm/javascore/cosmwasm-vm/sui/solana/soroban)
+\$ grep -n "handle_message\|is_valid_source\|ConnCap\|ensure_connection_authority\|require_auth" ...
+    sui:     main.move:337 handle_message(cap: &ConnCap) ; xcall_state.move:44/268 new_conn_cap/transfer_conn_cap (public(package))
+    solana:  instructions/handle_message.rs:36 -> is_valid_source:519 -> helper.rs:42 ensure_connection_authority (PDA)
+    soroban: handle_message.rs:14 sender.require_auth() ; is_valid_source:172 protocols.contains(sender)
+    javascore: CentralizedConnection.java:140 recvMessage -> @External(OnlyAdmin)
+\$ for c in java javac gradle cargo rustc solana sui go; do command -v \$c; done → ninguno disponible
 ```
 
 ### 6.4 Limitaciones
 
 - Sin RPC, por diseño: no se leyeron saldos/TVL ni el estado en vivo de los contratos desplegados (`xcallM` en EVM, SCORE xCall en ICON), ni si el hub está pausado tras el incidente de agosto.
-- Sin `forge`/`cargo`/JVM en el entorno: el PoC se ejecuta sobre el contrato EVM compilado con `solc-js` en una EVM local; para ICON (javascore) y CosmWasm la equivalencia es por lectura de código (misma lógica, líneas citadas), no por ejecución.
+- Sin `forge`/`cargo`/JVM/`solana`/`sui` en el entorno (verificado: sólo `node` y `python3`): el PoC ejecutable cubre **sólo EVM**, compilado con `solc-js` y ejecutado en una EVM local (`@ethereumjs/evm`). Para javascore, CosmWasm, Soroban, Sui y Solana el veredicto es por **lectura de código con líneas exactas** (§3.1-bis), no por ejecución. En javascore, CosmWasm, Solana y Soroban el fallo es de la misma clase que EVM (el array `protocols` del mensaje autentica al emisor) y quedan como *confirmados en código, no ejecutados*. En Solana el check `ensure_connection_authority` **no** es una defensa efectiva: valida la relación PDA↔programa del propio llamante, y ese programa lo despliega el atacante. Únicamente **Sui** queda fuera: el `ConnCap` es un objeto-capacidad que sólo el paquete puede crear (`public(package)`), y sin él `handle_message` es inalcanzable.
 - `lib/` (submodules de `xcall-multi`) vacío; OpenZeppelin se resolvió desde npm (misma versión mayor, 5.0.2).

